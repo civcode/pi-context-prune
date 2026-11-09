@@ -233,3 +233,80 @@ export function groupBatchesByMode(batches: CapturedBatch[], mode: BatchingMode)
 
   return out;
 }
+
+/**
+ * Identifies the assistant message of a live `turn_end` event.
+ * `entryId` is only used when the host exposes the persisted entry id; the
+ * current Pi contract does not, so `message` is the primary key.
+ */
+export interface LiveTurnIdentity {
+  entryId?: string;
+  message?: any;
+}
+
+function toolCallIdsOf(message: any): string[] {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return content
+    .filter((block: any) => block?.type === "toolCall" && typeof block.id === "string")
+    .map((block: any) => block.id);
+}
+
+/**
+ * Resolve the session-global assistant-message index for a live turn.
+ *
+ * Why this is needed: Pi's `turn_end` event reports an *invocation-local*
+ * `turnIndex` (`_turnIndex` is reset to 0 on every `agent_start`), while
+ * `captureUnindexedBatchesFromSession()` numbers assistant messages across the
+ * persisted session branch. The prune frontier compares against the session-global
+ * numbering, so feeding it invocation-local indices makes every turn of a later
+ * prompt look already processed (`turn 0 < frontier turn 9`), and live capture
+ * silently stops queueing batches after the first prompt.
+ *
+ * The returned index uses exactly the same counting semantics as
+ * `captureUnindexedBatchesFromSession()`: one increment per assistant message,
+ * user and tool-result messages ignored.
+ *
+ * Returns `null` only when the turn cannot be identified at all (no assistant
+ * message and no matching entry id), so callers can fall back to the session
+ * scan instead of comparing against an unnormalized index.
+ */
+export function resolveSessionTurnIndex(
+  branch: any[],
+  identity: LiveTurnIdentity = {}
+): number | null {
+  const message = identity.message;
+  const hasEntryId = typeof identity.entryId === "string" && identity.entryId.length > 0;
+  const isAssistant = message?.role === "assistant";
+
+  if (!hasEntryId && !isAssistant) return null;
+
+  const wantedToolCallIds = toolCallIdsOf(message);
+  let assistantIndex = 0;
+
+  for (const entry of branch) {
+    if (entry?.type !== "message") continue;
+    const entryMessage = entry.message;
+    if (entryMessage?.role !== "assistant") continue;
+
+    const matchedByIdentity =
+      (hasEntryId && entry.id === identity.entryId) ||
+      (message !== undefined && entryMessage === message) ||
+      (wantedToolCallIds.length > 0 &&
+        toolCallIdsOf(entryMessage).length === wantedToolCallIds.length &&
+        wantedToolCallIds.every((id) => toolCallIdsOf(entryMessage).includes(id)));
+
+    if (matchedByIdentity) return assistantIndex;
+    assistantIndex++;
+  }
+
+  // An entry id was supplied but does not exist in the branch: the turn identity
+  // is unreliable, so the caller must fall back to the session scan rather than
+  // guessing an index.
+  if (hasEntryId) return null;
+
+  // The host has not written this assistant message to the branch yet (some Pi
+  // versions persist after the turn_end event). It is by definition after every
+  // assistant message we can see, so the count is its session-global index.
+  if (isAssistant) return assistantIndex;
+  return null;
+}

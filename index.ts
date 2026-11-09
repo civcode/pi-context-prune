@@ -15,7 +15,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./src/config.js";
-import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode } from "./src/batch-capture.js";
+import { captureBatch, captureUnindexedBatchesFromSession, groupBatchesByMode, resolveSessionTurnIndex } from "./src/batch-capture.js";
 import { summarizeBatch, summarizeBatches } from "./src/summarizer.js";
 import { ToolCallIndexer } from "./src/indexer.js";
 import { pruneMessages } from "./src/pruner.js";
@@ -36,7 +36,7 @@ import {
 } from "./src/types.js";
 import { StatsAccumulator } from "./src/stats.js";
 import { registerContextPruneTool } from "./src/context-prune-tool.js";
-import { PruneFrontierTracker } from "./src/frontier.js";
+import { PruneFrontierTracker, trimBatchToPendingRange } from "./src/frontier.js";
 import { reportSummarizerUsage, type UsageSession } from "./src/usage-report.js";
 
 export default function (pi: ExtensionAPI) {
@@ -105,31 +105,31 @@ export default function (pi: ExtensionAPI) {
 
   const isFinalAssistantMessage = (message: any) => message?.role === "assistant" && !assistantMessageHasToolCalls(message);
 
-  const trimBatchToPendingRange = (batch: CapturedBatch): CapturedBatch | null => {
-    const currentFrontier = frontier.get();
-    let toolCalls = batch.toolCalls;
+  const trimBatch = (batch: CapturedBatch): CapturedBatch | null =>
+    trimBatchToPendingRange(batch, frontier.get(), indexer);
 
-    // The indexer tells us what was successfully summarized earlier.
-    toolCalls = toolCalls.filter((tc) => !indexer.isSummarized(tc.toolCallId));
-    if (toolCalls.length === 0) return null;
+  // Tool calls that are already sitting in the pending queue. The live-capture
+  // fallback re-scans the session, which would otherwise re-queue batches queued
+  // on an earlier turn and inflate the pending counter.
+  const queuedToolCallIds = new Set<string>();
 
-    // The frontier tells us the last attempted boundary even when the attempt did
-    // not persist index entries (e.g. skipped-oversized). When the LLM prunes in
-    // the middle of a long tool chain, keep later tool calls from the same turn
-    // instead of dropping the whole batch on the floor.
-    if (!currentFrontier) return { ...batch, toolCalls };
-    if (batch.turnIndex < currentFrontier.lastAttemptedTurnIndex) return null;
-    if (batch.turnIndex > currentFrontier.lastAttemptedTurnIndex) return { ...batch, toolCalls };
+  const queuePendingBatch = (batch: CapturedBatch | null): boolean => {
+    if (!batch || batch.toolCalls.length === 0) return false;
+    if (batch.toolCalls.every((tc) => queuedToolCallIds.has(tc.toolCallId))) return false;
+    pendingBatches.push(batch);
+    for (const tc of batch.toolCalls) queuedToolCallIds.add(tc.toolCallId);
+    return true;
+  };
 
-    const originalIndex = toolCalls.findIndex((tc) => tc.toolCallId === currentFrontier.lastAttemptedToolCallId);
-    if (originalIndex < 0) return { ...batch, toolCalls };
-
-    const remaining = toolCalls.slice(originalIndex + 1);
-    if (remaining.length === 0) return null;
-    return { ...batch, toolCalls: remaining };
+  const clearPendingBatches = () => {
+    pendingBatches.length = 0;
+    queuedToolCallIds.clear();
   };
 
   const restoreBatches = (batches: CapturedBatch[]) => {
+    for (const batch of batches) {
+      for (const tc of batch.toolCalls) queuedToolCallIds.add(tc.toolCallId);
+    }
     pendingBatches.unshift(...batches);
   };
 
@@ -163,7 +163,7 @@ export default function (pi: ExtensionAPI) {
       batches = pendingBatches.slice();
     }
     batches = batches
-      .map((batch) => trimBatchToPendingRange(batch))
+      .map((batch) => trimBatch(batch))
       .filter((batch): batch is CapturedBatch => batch !== null);
     return groupBatchesByMode(batches, currentConfig.value.batchingMode);
   };
@@ -191,7 +191,7 @@ export default function (pi: ExtensionAPI) {
     // Draining the queue since we've captured the state via session or slice.
     // We drain BEFORE the await so concurrent calls (though guarded by isFlushing)
     // or rapid turn-ends don't result in double-summarization.
-    pendingBatches.length = 0;
+    clearPendingBatches();
 
     isFlushing = true;
 
@@ -433,7 +433,7 @@ export default function (pi: ExtensionAPI) {
     hydrateFromSession(ctx);
 
     // Clear any batches queued before the session reload
-    pendingBatches.length = 0;
+    clearPendingBatches();
 
     // Update footer status
     setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
@@ -453,7 +453,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     hydrateFromSession(ctx);
     // Pending batches belong to the old branch — discard them
-    pendingBatches.length = 0;
+    clearPendingBatches();
   });
 
   // ── turn_end: capture batch, flush immediately or queue ──────────────────
@@ -469,22 +469,50 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const capturedBatch = captureBatch(
-      event.message,
-      event.toolResults,
-      event.turnIndex,
-      Date.now()
-    );
-    const batch = trimBatchToPendingRange({
-      ...capturedBatch,
-      // Do not summarize the pruner's own housekeeping tool result. Otherwise
-      // agentic-auto mode can queue the context_prune result and try to flush it
-      // during agent_end, when Pi may already have invalidated the extension ctx.
-      toolCalls: capturedBatch.toolCalls.filter((tc) => tc.toolName !== CONTEXT_PRUNE_TOOL_NAME),
+    // Pi's `event.turnIndex` is invocation-local: `_turnIndex` is reset to 0 on
+    // every agent_start. The prune frontier and the session scanner both number
+    // assistant messages session-globally, so live batches must be normalized to
+    // that numbering — otherwise every turn after the first prompt of a session
+    // compares as `turn 0 < frontier turn N` and is dropped before queueing.
+    const branch = ctx.sessionManager.getBranch();
+    const turnIndex = resolveSessionTurnIndex(branch, {
+      // Not part of the current Pi event contract; harmless when absent.
+      entryId: (event as any).messageEntryId,
+      message: event.message,
     });
-    if (!batch) return;
 
-    pendingBatches.push(batch);
+    let batches: CapturedBatch[];
+    if (turnIndex !== null) {
+      const capturedBatch = captureBatch(
+        event.message,
+        event.toolResults,
+        turnIndex,
+        Date.now()
+      );
+      batches = [
+        trimBatch({
+          ...capturedBatch,
+          // Do not summarize the pruner's own housekeeping tool result. Otherwise
+          // agentic-auto mode can queue the context_prune result and try to flush
+          // it during agent_end, when Pi may already have invalidated the ctx.
+          toolCalls: capturedBatch.toolCalls.filter((tc) => tc.toolName !== CONTEXT_PRUNE_TOOL_NAME),
+        }),
+      ];
+    } else {
+      // The live turn could not be matched to a persisted assistant message
+      // (host event contract differs from what we expect). Fall back to the
+      // session scan, which numbers turns exactly like the frontier does, so no
+      // unnormalized index is ever compared. Dedupe is handled by queuePendingBatch.
+      batches = captureUnindexedBatchesFromSession(branch, indexer, [CONTEXT_PRUNE_TOOL_NAME])
+        .map((batch) => trimBatch(batch))
+        .filter((batch): batch is CapturedBatch => batch !== null);
+    }
+
+    let queued = 0;
+    for (const batch of batches) {
+      if (queuePendingBatch(batch)) queued++;
+    }
+    if (queued === 0) return;
 
     if (currentConfig.value.pruneOn === "every-turn") {
       await flushPending(ctx, { delivery: "session" });

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { PruneFrontier } from "./types.js";
+import type { CapturedBatch, PruneFrontier } from "./types.js";
 import { CUSTOM_TYPE_FRONTIER } from "./types.js";
 
 /**
@@ -59,4 +59,39 @@ export class PruneFrontierTracker {
     if (!this.frontier) return;
     pi.appendEntry(CUSTOM_TYPE_FRONTIER, this.frontier);
   }
+}
+
+/**
+ * Remove the part of a captured batch that the frontier (and the indexer) say has
+ * already been handled.
+ *
+ * Extracted from the extension entry point so the frontier semantics can be
+ * exercised without a live agent session. `batch.turnIndex` must be the
+ * session-global assistant-message index produced by `resolveSessionTurnIndex()`
+ * or `captureUnindexedBatchesFromSession()`; both use the same numbering.
+ */
+export function trimBatchToPendingRange(
+  batch: CapturedBatch,
+  frontier: PruneFrontier | null,
+  indexer: { isSummarized(id: string): boolean }
+): CapturedBatch | null {
+  // The indexer tells us what was successfully summarized earlier.
+  const toolCalls = batch.toolCalls.filter((tc) => !indexer.isSummarized(tc.toolCallId));
+  if (toolCalls.length === 0) return null;
+
+  if (!frontier) return { ...batch, toolCalls };
+
+  // Strictly earlier turns are already behind the frontier. With normalized
+  // session-global indices this no longer misclassifies turns of a new prompt.
+  if (batch.turnIndex < frontier.lastAttemptedTurnIndex) return null;
+  if (batch.turnIndex > frontier.lastAttemptedTurnIndex) return { ...batch, toolCalls };
+
+  // Same turn: the frontier tells us where the previous attempt stopped, so keep
+  // the tool calls that came after it instead of dropping the whole batch.
+  const originalIndex = toolCalls.findIndex((tc) => tc.toolCallId === frontier.lastAttemptedToolCallId);
+  if (originalIndex < 0) return { ...batch, toolCalls };
+
+  const remaining = toolCalls.slice(originalIndex + 1);
+  if (remaining.length === 0) return null;
+  return { ...batch, toolCalls: remaining };
 }

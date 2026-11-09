@@ -31,6 +31,7 @@ pi-context-prune/
     ├── types.ts                   # Shared types, constants, and interfaces (including PruneOn modes)
     ├── config.ts                  # Load/save ~/.pi/agent/context-prune/settings.json
     ├── batch-capture.ts           # Capture turn results from events or session branch
+    ├── frontier.ts                # PruneFrontierTracker + pure trimBatchToPendingRange() filter
     ├── summarizer.ts              # LLM call that summarizes a CapturedBatch to markdown
     ├── indexer.ts                 # Runtime Map<toolCallId, ToolCallRecord> + session persistence
     ├── pruner.ts                  # Filter context event messages (removes summarized ToolResultMessages)
@@ -53,7 +54,7 @@ Wires all modules together and registers Pi event handlers:
 - **`syncToolActivation()`** — activates or deactivates the `context_prune` tool in the Pi active-tools list based on whether `enabled && pruneOn === "agentic-auto"`. Uses `pi.getActiveTools()` / `pi.setActiveTools()` (ExtensionAPI, not ExtensionContext).
 - **`session_start`** — loads config from `~/.pi/agent/context-prune/settings.json`, rebuilds the in-memory index and stats accumulator, clears `pendingBatches`, updates the footer status widget, calls `syncToolActivation()`, and notifies the user of the loaded state.
 - **`session_tree`** — rebuilds the index and stats accumulator after branch navigation (pending batches and stats belong to the current branch).
-- **`turn_end`** — captures the batch (filtering out any `context_prune` tool call to avoid re-queuing agentic-auto housekeeping), pushes to `pendingBatches`. Behavior depends on `pruneOn` mode:
+- **`turn_end`** — when `pruneOn === "agentic-auto"`, normalizes the live turn to a **session-global** index with `resolveSessionTurnIndex()` (Pi's `event.turnIndex` is invocation-local and resets on every `agent_start`), filters out any `context_prune` tool call to avoid re-queuing agentic-auto housekeeping, and pushes the trimmed batch onto `pendingBatches` through `queuePendingBatch()` (which dedupes tool calls already queued via `queuedToolCallIds`). If the assistant message cannot be resolved in the persisted branch, the handler falls back to `captureUnindexedBatchesFromSession()` instead of comparing an unnormalized index. Behavior depends on `pruneOn` mode:
   - `every-turn`: flushes immediately with `delivery: "session"`.
   - `on-context-tag` / `on-demand` / `agent-message` / `agentic-auto`: queues and notifies the user of pending count and trigger.
 - **`tool_execution_end`** — when `event.toolName` is `context_checkpoint` (or the legacy `context_tag`) and mode is `on-context-tag`, calls `flushPending` with `delivery: "runtime"`.
@@ -102,6 +103,11 @@ Single source of truth for all interfaces and constants:
 - **`groupBatchesByMode(batches, mode)`** — applies the batching-mode grouping. `"turn"` returns batches unchanged (one summary per assistant turn). `"agent-message"` merges consecutive batches that share the same `userTurnGroup` into a single `CapturedBatch` (concat `toolCalls`, join `assistantText`, keep last `turnIndex`/`timestamp`). Batches without `userTurnGroup` (live `turn_end` path) are always passed through one-per-batch. Called in `flushPending` after frontier trimming and before `summarizeBatches`.
 - **`serializeBatchForSummarizer(batch)`** — renders a single `CapturedBatch` as plain text for the summarizer LLM. Includes `assistantText` as a header if present. Truncates individual result text at 2 000 chars to keep the summarizer prompt manageable.
 - **`serializeBatchesForSummarizer(batches)`** — renders multiple `CapturedBatch` objects into a single text block for batched summarization. Each batch is rendered as a `=== Turn N ===` section, separated by blank lines. Reuses `serializeBatchForSummarizer` for each batch's body.
+- **`resolveSessionTurnIndex(branch, { entryId?, message? })`** — maps a live `turn_end` assistant message to its session-global assistant-message index (the same numbering `captureUnindexedBatchesFromSession()` uses). Matches by persisted entry id when the host provides one, otherwise by object identity or tool-call ids. Returns `null` only when the turn identity cannot be established at all.
+
+### `src/frontier.ts` — Prune frontier
+- **`PruneFrontierTracker`** — persists/reads the last attempted prune boundary (`CUSTOM_TYPE_FRONTIER`) so previously handled tool calls are never re-summarized, including when a summarizer call failed or a summary was skipped as oversized.
+- **`trimBatchToPendingRange(batch, frontier, indexer)`** — pure function that drops already-summarized tool calls and any batch entirely behind the frontier, and slices the remainder when the frontier stopped mid-turn. Extracted from `index.ts` so frontier semantics can be unit-tested without a live agent session.
 
 ### `src/summarizer.ts` — LLM summarization
 - **`summarizerThinkingOptions(config)`** — translates `config.summarizerThinking` into a provider-call options object. `"default"` returns `{}`; `"off"` returns `{ reasoningEffort: undefined }`; all other levels return `{ reasoningEffort: level }`. Provider adapters translate `reasoningEffort` into the provider-specific field.
@@ -214,6 +220,7 @@ Accumulates cumulative token/cost stats for summarizer LLM calls and persists th
 
 | Decision | Rationale |
 |---|---|
+| Session-global turn indices (`resolveSessionTurnIndex`) | Pi's `turn_end.turnIndex` resets to 0 on every `agent_start`, while the frontier and session scanner count assistant messages across the whole session. Without normalization, every turn after the first prompt is treated as already processed and live capture stops queueing batches |
 | Pruning only `ToolResultMessage`s | `AssistantMessage` tool-call blocks (which carry IDs) are kept so the model can call `context_tree_query` by ID |
 | Two `flushPending` delivery modes | `"runtime"` uses `pi.sendMessage` steer (safe during active agent loops); `"session"` writes via `sessionManager` directly (safe when Pi may be shutting down the session after print-mode runs) |
 | `pi.appendEntry` for persistence | Session custom entries survive restarts and branch navigation; index is rebuilt on `session_start` / `session_tree` |
