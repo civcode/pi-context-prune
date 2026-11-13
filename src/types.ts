@@ -221,6 +221,10 @@ export interface CapturedToolCall {
   args: Record<string, unknown>;
   resultText: string;
   isError: boolean;
+  /** Original session-global assistant turn, needed for safe split-batch frontiers. */
+  sourceTurnIndex?: number;
+  /** Original capture timestamp, retained when agent-message batches are merged. */
+  sourceTimestamp?: number;
 }
 
 /**
@@ -374,6 +378,8 @@ export interface FlushOptions {
    * the currently-running batch. Used by `/pruner now` to show live progress.
    */
   onBatchTextProgress?: BatchTextProgressCallback;
+  /** Progress text used only after automatic context-overflow recovery starts. */
+  onRecoveryProgress?: (message: string) => void;
   /**
    * Pre-captured batches from a prior `capturePendingBatches()` call.
    * When set, `flushPending` skips the internal capture step and uses these directly.
@@ -395,6 +401,8 @@ export interface SummarizeBatchOptions {
   onUsage?: (response: import("@earendil-works/pi-ai").AssistantMessage) => void;
   /** Receives the number of summary text characters streamed so far. */
   onTextProgress?: (receivedChars: number) => void;
+  /** Called instead of showing an error notification for a recognized context overflow. */
+  onContextOverflow?: (message: string) => void;
   /**
    * Abort signal — when fired the in-flight stream call is cancelled and the
    * batch is treated as aborted (not a summarizer failure).
@@ -413,6 +421,8 @@ export interface SummarizeBatchesOptions {
   onUsage?: (batch: CapturedBatch, response: import("@earendil-works/pi-ai").AssistantMessage) => void;
   /** Receives streamed summary text character counts for each batch. */
   onBatchTextProgress?: BatchTextProgressCallback;
+  /** Callback for oversized batches that should be retried as chronological halves. */
+  onContextOverflow?: (index: number, batch: CapturedBatch, message: string) => void;
   /**
    * Abort signal forwarded to every individual summarizeBatch() call.
    * When fired, all in-flight stream calls are cancelled.
