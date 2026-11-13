@@ -9,6 +9,7 @@ import type {
   SummarizeResult,
 } from "./types.js";
 import { serializeBatchForSummarizer } from "./batch-capture.js";
+import { isContextOverflow } from "./recursive-split.js";
 
 const SYSTEM_PROMPT = `You are summarizing a batch of tool calls made by an AI coding assistant.
 For each tool call provide:
@@ -181,8 +182,14 @@ export async function summarizeBatch(
     // Propagate abort errors upward so flushPending can check signal.aborted
     // and return { ok: false, reason: "aborted" } without showing a UI error.
     if (options.signal?.aborted) throw err;
+    // Context-limit rejection is a recoverable internal signal: the caller
+    // will retry chronological halves. Do not notify Pi on that path.
+    if (options.onContextOverflow && isContextOverflow(err)) {
+      options.onContextOverflow(err instanceof Error ? err.message : String(err));
+      return null;
+    }
     ctx.ui.notify(
-      `pruner: summarization failed: ${err.message}`,
+      `pruner: summarization failed: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
     return null;
@@ -216,6 +223,7 @@ export async function summarizeBatches(
         signal: options.signal,
         sessionId: options.sessionId,
         onUsage: (response) => options.onUsage?.(batches[0], response),
+        onContextOverflow: (message) => options.onContextOverflow?.(0, batches[0], message),
         onTextProgress: (receivedChars) => {
           options.onBatchTextProgress?.(0, 1, batches[0], receivedChars);
         },
@@ -231,6 +239,7 @@ export async function summarizeBatches(
         signal: options.signal,
         sessionId: options.sessionId,
         onUsage: (response) => options.onUsage?.(batch, response),
+        onContextOverflow: (message) => options.onContextOverflow?.(index, batch, message),
         onTextProgress: (receivedChars) => {
           options.onBatchTextProgress?.(index, batches.length, batch, receivedChars);
         },
