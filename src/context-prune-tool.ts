@@ -61,6 +61,10 @@ export function registerContextPruneTool(
         let lastProgressText = "Context prune running…";
         const result = await flushFn(ctx, {
           signal,
+          onRecoveryProgress: (message) => {
+            lastProgressText = message;
+            sendToolProgress(onUpdate, message);
+          },
           onBatchTextProgress: (index, total, batch, receivedChars) => {
             const next = pruneProgressText(batch, index, total, receivedChars, "running");
             if (next === lastProgressText) return;
