@@ -303,6 +303,12 @@ export default function (pi: ExtensionAPI) {
             i, originalCount, batch,
             pieces.every((part) => part.result !== null) ? "done" : "skipped"
           );
+          if (overflow && pieces.some((part) => part.result === null)) {
+            // Recovery stopped mid-batch. Do not spend model calls on later
+            // batches that cannot be persisted before this unresolved range.
+            expanded.push(...batches.slice(i + 1).map((remaining) => ({ batch: remaining, result: null })));
+            break;
+          }
         }
         batches = expanded.map((part) => part.batch);
         results = expanded.map((part) => part.result);
@@ -322,12 +328,18 @@ export default function (pi: ExtensionAPI) {
           results = originalResults;
         } else {
           const expanded: SplitSegment<import("./src/types.js").SummarizeResult>[] = [];
+          let blocked = false;
           for (let i = 0; i < originalCount; i++) {
             const batch = batches[i];
-            if (overflowed.has(i)) {
-              expanded.push(...await recoverOverflow(batch, i, originalCount));
+            if (blocked) {
+              expanded.push({ batch, result: null });
+            } else if (overflowed.has(i)) {
+              const recovered = await recoverOverflow(batch, i, originalCount);
+              expanded.push(...recovered);
+              blocked = recovered.some((part) => part.result === null);
             } else {
               expanded.push({ batch, result: originalResults[i] });
+              blocked = originalResults[i] === null;
             }
           }
           batches = expanded.map((part) => part.batch);
