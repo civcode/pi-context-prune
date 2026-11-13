@@ -44,6 +44,10 @@ export function captureBatch(
         args: block.input ?? block.args ?? block.arguments ?? {},
         resultText,
         isError,
+        // Keep the original position even when agent-message mode merges turns.
+        // Recursive split results must not advance the frontier to a later turn.
+        sourceTurnIndex: turnIndex,
+        sourceTimestamp: timestamp,
       } satisfies CapturedToolCall;
     });
 
