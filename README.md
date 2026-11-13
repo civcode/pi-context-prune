@@ -195,6 +195,12 @@ When the model calls `context_prune`:
 
 The tool is guided by a system prompt that instructs the model to use it after completing a meaningful batch of work (not after every trivial call).
 
+### Oversized summarizer requests
+
+When a provider explicitly reports a **context-window overflow**, the pruner silently splits that batch into two contiguous halves by **tool-call count** and retries the first half before the second. Either half can be split again recursively. Original tool-call order and session-global turn positions are retained for persisted summaries and the prune frontier. No tokenizer, provider-specific batch size, or new setting is required; successful first attempts still use one summarizer request.
+
+Other provider errors are reported normally. If even one tool call exceeds the summarizer context window, its original output remains available and a warning is shown. Successful earlier halves are kept and only the unfinished range remains pending. Recoverable overflow errors do not display pruner error notifications.
+
 ## Configuration
 
 Config is stored in `~/.pi/agent/context-prune/settings.json` (global, project-independent):
