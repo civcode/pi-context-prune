@@ -128,14 +128,19 @@ function createHarness(settings, session = SessionManager.inMemory(), summarize)
           summarizerCalls++;
           const prompt = context.messages[0].content[0].text;
           const ids = [...prompt.matchAll(/"id": "([^"]+)"/g)].map((match) => match[1]);
-          const text = summarize ? summarize(prompt, ids) : `Summary of ${ids.length} tool calls: ${ids.join(', ')}`;
+          const reply = summarize ? summarize(prompt, ids) : `Summary of ${ids.length} tool calls: ${ids.join(', ')}`;
+          // Regression tests can simulate a provider's structured failed
+          // stream result without making any actual model requests.
+          const failed = reply && typeof reply === 'object' && typeof reply.error === 'string';
+          const text = failed ? '' : reply;
           const response = {
             role: 'assistant',
             provider: 'mock',
             model: 'mock-model',
             responseModel: 'mock-model',
             content: [{ type: 'text', text }],
-            stopReason: 'stop',
+            stopReason: failed ? 'error' : 'stop',
+            errorMessage: failed ? reply.error : undefined,
             usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 } },
           };
           return {
@@ -741,6 +746,109 @@ test('trimBatchToPendingRange keeps mid-turn remainder and drops fully-processed
     indexer
   );
   assert.deepEqual(noFrontier.toolCalls.map((tc) => tc.toolCallId), ['z']);
+});
+
+// ── Recursive overflow recovery — real extension integration ────────────────
+test('K: context overflow splits an agent-message batch left-first with persisted order', async () => {
+  const attempts = [];
+  const harness = createHarness(agenticAuto, SessionManager.inMemory(), (_prompt, ids) => {
+    attempts.push(ids.join(','));
+    return ids.length > 2
+      ? { error: 'request exceeds the context window: prompt too long' }
+      : `Summary for ${ids.join(', ')}`;
+  });
+  await harness.handlers.get('session_start')({}, harness.ctx);
+
+  await runPrompt(harness, 'overflow prompt', [
+    [{ id: 'k1', name: 'read' }, { id: 'k2', name: 'read' }],
+    [{ id: 'k3', name: 'read' }, { id: 'k4', name: 'read' }],
+    [{ id: 'k5', name: 'read' }, { id: 'k6', name: 'read' }],
+    [{ id: 'k7', name: 'read' }, { id: 'k8', name: 'read' }],
+  ]);
+  const result = await prune(harness);
+  assert.equal(result.ok, true);
+  assert.equal(result.toolCallCount, 8);
+  assert.equal(result.batchCount, 4);
+  assert.equal(harness.summarizerCallCount(), 7);
+  assert.deepEqual(attempts, [
+    'k1,k2,k3,k4,k5,k6,k7,k8',
+    'k1,k2,k3,k4',
+    'k1,k2',
+    'k3,k4',
+    'k5,k6,k7,k8',
+    'k5,k6',
+    'k7,k8',
+  ]);
+  assert.deepEqual(
+    indexedToolCallIds(harness.session).map((record) => record.id),
+    ['k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7', 'k8']
+  );
+  assert.deepEqual(
+    frontierEntries(harness.session).at(-1).lastAttemptedToolCallId,
+    'k8'
+  );
+  assert.equal(frontierEntries(harness.session).at(-1).lastAttemptedTurnIndex, 3);
+  assert.equal(summaryEntries(harness.session).length, 4);
+  assert.equal(harness.notifications.filter((note) => note.type === 'error').length, 0);
+
+  // Reload from persisted entries, then confirm the original calls are not
+  // summarized twice and new work can still advance the session-global frontier.
+  const restarted = createHarness(agenticAuto, harness.session);
+  await restarted.handlers.get('session_start')({}, restarted.ctx);
+  assert.equal((await prune(restarted)).reason, 'empty');
+  await runPrompt(restarted, 'next prompt', [[{ id: 'k9', name: 'read' }]]);
+  const next = await prune(restarted);
+  assert.equal(next.ok, true);
+  assert.deepEqual(
+    indexedToolCallIds(restarted.session).map((record) => record.id),
+    ['k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7', 'k8', 'k9']
+  );
+  assert.ok(frontierEntries(restarted.session).at(-1).lastAttemptedTurnIndex > 3);
+});
+
+test('K2: a later non-context error retains successful prefix and retries only pending work', async () => {
+  let failMiddle = true;
+  const attempts = [];
+  const session = SessionManager.inMemory();
+  const harness = createHarness(agenticAuto, session, (_prompt, ids) => {
+    attempts.push(ids.join(','));
+    if (failMiddle && ids.join(',') === 'v3,v4') return { error: 'invalid API key' };
+    return ids.length > 2
+      ? { error: 'request exceeds the context window' }
+      : `Summary for ${ids.join(', ')}`;
+  });
+  await harness.handlers.get('session_start')({}, harness.ctx);
+  await runPrompt(harness, 'partial failure', [
+    [{ id: 'v1', name: 'read' }, { id: 'v2', name: 'read' }],
+    [{ id: 'v3', name: 'read' }, { id: 'v4', name: 'read' }],
+    [{ id: 'v5', name: 'read' }, { id: 'v6', name: 'read' }],
+    [{ id: 'v7', name: 'read' }, { id: 'v8', name: 'read' }],
+  ]);
+  const partial = await prune(harness);
+  assert.equal(partial.ok, true);
+  assert.deepEqual(indexedToolCallIds(session).map((r) => r.id), ['v1', 'v2']);
+  assert.equal(frontierEntries(session).at(-1).lastAttemptedToolCallId, 'v2');
+  assert.equal(frontierEntries(session).at(-1).lastAttemptedTurnIndex, 0);
+  assert.equal(harness.notifications.filter((note) => note.type === 'error').length, 1);
+  assert.deepEqual(attempts.slice(0, 4), [
+    'v1,v2,v3,v4,v5,v6,v7,v8', 'v1,v2,v3,v4', 'v1,v2', 'v3,v4'
+  ]);
+  assert.ok(!attempts.includes('v5,v6,v7,v8'), 'do not attempt later half after earlier failure');
+
+  failMiddle = false;
+  const restarted = createHarness(agenticAuto, session, (_prompt, ids) => (
+    ids.length > 2
+      ? { error: 'request exceeds the context window' }
+      : `Summary for ${ids.join(', ')}`
+  ));
+  await restarted.handlers.get('session_start')({}, restarted.ctx);
+  const recovered = await prune(restarted);
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(indexedToolCallIds(session).map((r) => r.id), [
+    'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'
+  ]);
+  assert.equal(frontierEntries(session).at(-1).lastAttemptedToolCallId, 'v8');
+  assert.equal(frontierEntries(session).at(-1).lastAttemptedTurnIndex, 3);
 });
 
 process.on('exit', () => {
