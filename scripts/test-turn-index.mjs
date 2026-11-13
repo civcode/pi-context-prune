@@ -806,6 +806,22 @@ test('K: context overflow splits an agent-message batch left-first with persiste
   assert.ok(frontierEntries(restarted.session).at(-1).lastAttemptedTurnIndex > 3);
 });
 
+test('K1: a normal large-enough batch still uses exactly one request', async () => {
+  const harness = createHarness(agenticAuto);
+  await harness.handlers.get('session_start')({}, harness.ctx);
+  await runPrompt(harness, 'normal prompt', [
+    [{ id: 'normal1', name: 'read' }, { id: 'normal2', name: 'read' }],
+    [{ id: 'normal3', name: 'read' }, { id: 'normal4', name: 'read' }],
+    [{ id: 'normal5', name: 'read' }, { id: 'normal6', name: 'read' }],
+    [{ id: 'normal7', name: 'read' }, { id: 'normal8', name: 'read' }],
+  ]);
+  const result = await prune(harness);
+  assert.equal(result.ok, true);
+  assert.equal(result.batchCount, 1);
+  assert.equal(harness.summarizerCallCount(), 1, 'successful full request requires no additional attempts');
+  assert.equal(summaryEntries(harness.session).length, 1);
+});
+
 test('K2: a later non-context error retains successful prefix and retries only pending work', async () => {
   let failMiddle = true;
   const attempts = [];
