@@ -236,102 +236,103 @@ export default function (pi: ExtensionAPI) {
         options.onBatchTextProgress?.(index, total, batch, receivedChars);
       };
 
-      // Summarize batches. When onProgress is provided (i.e. /pruner now with the
-      // multi-row overlay) we process sequentially so each row can be checked off
-      // as its LLM call completes. Otherwise all batches run in parallel.
-      let results: (import("./src/types.js").SummarizeResult | null)[];
-      // The normal request is always attempted first. Only known context
-      // overflows are retried via binary splitting; successful requests keep
-      // exactly the same model-call and persistence path as before.
-      const overflowed = new Set<number>();
-      if (options.onProgress) {
-        results = [];
-        for (let i = 0; i < batches.length; i++) {
-          options.onProgress(i, batches.length, batches[i], "start");
-          const r = await summarizeBatch(batches[i], currentConfig.value, ctx, {
+      // The original full-batch attempt runs exactly as before. Only recognized
+      // context overflow triggers an additional sequential, left-first retry.
+      const recoverOverflow = async (
+        batch: CapturedBatch,
+        index: number,
+        total: number,
+      ): Promise<SplitSegment<import("./src/types.js").SummarizeResult>[]> => {
+        const retry = async (part: CapturedBatch) => {
+          if (options.signal?.aborted) throw new Error("pruner: split retry aborted");
+          options.onRecoveryProgress?.(`✂ Summarizing ${part.toolCalls.length} tool calls from split batch…`);
+          let overflow = false;
+          const result = await summarizeBatch(part, currentConfig.value, ctx, {
             signal: options.signal,
             sessionId: usageSessionId,
-            onUsage: (response) => onUsage(batches[i], response),
-            onContextOverflow: () => overflowed.add(i),
+            onUsage: (response) => onUsage(part, response),
+            onContextOverflow: () => { overflow = true; },
+            onTextProgress: (receivedChars) =>
+              reportBatchTextProgress(index, total, part, receivedChars),
+          });
+          return overflow
+            ? { kind: "context-overflow" as const }
+            : result
+              ? { kind: "success" as const, value: result }
+              : { kind: "failure" as const };
+        };
+
+        return splitOverflowingBatch(batch, retry, {
+          onSplit: () => {
+            setPruneStatusWidget(ctx, currentConfig.value, "splitting oversized batch…", statsAccum.getStats());
+            options.onRecoveryProgress?.("✂ Splitting oversized batch…");
+          },
+          onSingleCallOverflow: (part) => safeNotify(
+            ctx,
+            `pruner: one tool call (${part.toolCalls[0].toolName}) still exceeds the summarizer context window; original output retained`,
+            "warning"
+          ),
+        });
+      };
+
+      const originalCount = batches.length;
+      let results: (import("./src/types.js").SummarizeResult | null)[];
+      if (options.onProgress) {
+        // /pruner now was already sequential. Finish the first batch's split
+        // recovery before starting any later original batch.
+        const expanded: SplitSegment<import("./src/types.js").SummarizeResult>[] = [];
+        for (let i = 0; i < originalCount; i++) {
+          const batch = batches[i];
+          options.onProgress(i, originalCount, batch, "start");
+          let overflow = false;
+          const result = await summarizeBatch(batch, currentConfig.value, ctx, {
+            signal: options.signal,
+            sessionId: usageSessionId,
+            onUsage: (response) => onUsage(batch, response),
+            onContextOverflow: () => { overflow = true; },
             onTextProgress: (receivedChars) => {
-              reportBatchTextProgress(i, batches.length, batches[i], receivedChars);
+              reportBatchTextProgress(i, originalCount, batch, receivedChars);
             },
           });
-          results.push(r);
-          // A recoverable overflow is not a skipped batch; its row remains
-          // running until the chronological retries have completed.
-          if (!overflowed.has(i)) {
-            options.onProgress(i, batches.length, batches[i], r ? "done" : "skipped");
-          }
+
+          const pieces = overflow
+            ? await recoverOverflow(batch, i, originalCount)
+            : [{ batch, result }];
+          expanded.push(...pieces);
+          options.onProgress(
+            i, originalCount, batch,
+            pieces.every((part) => part.result !== null) ? "done" : "skipped"
+          );
         }
+        batches = expanded.map((part) => part.batch);
+        results = expanded.map((part) => part.result);
       } else {
-        // Parallel — one LLM call per batch, all in flight simultaneously.
-        results = await summarizeBatches(batches, currentConfig.value, ctx, {
+        // Preserve parallel original calls and their usage accounting. Recovery
+        // of rejected batches is sequential within each batch; summaries are
+        // persisted only after ordering their results by original tool call.
+        const overflowed = new Set<number>();
+        const originalResults = await summarizeBatches(batches, currentConfig.value, ctx, {
           onBatchTextProgress: reportBatchTextProgress,
           onContextOverflow: (index) => overflowed.add(index),
           onUsage,
           signal: options.signal,
           sessionId: usageSessionId,
         });
-      }
-
-      if (overflowed.size > 0) {
-        const expanded: SplitSegment<import("./src/types.js").SummarizeResult>[] = [];
-        const originalCount = batches.length;
-
-        // First attempts above keep the existing sequential/parallel behavior.
-        // Only rejected batches take this additional left-first sequential path.
-        for (let i = 0; i < originalCount; i++) {
-          const batch = batches[i];
-          if (!overflowed.has(i)) {
-            expanded.push({ batch, result: results[i] });
-            continue;
+        if (overflowed.size === 0) {
+          results = originalResults;
+        } else {
+          const expanded: SplitSegment<import("./src/types.js").SummarizeResult>[] = [];
+          for (let i = 0; i < originalCount; i++) {
+            const batch = batches[i];
+            if (overflowed.has(i)) {
+              expanded.push(...await recoverOverflow(batch, i, originalCount));
+            } else {
+              expanded.push({ batch, result: originalResults[i] });
+            }
           }
-
-          const retry = async (part: CapturedBatch) => {
-            if (options.signal?.aborted) throw new Error("pruner: split retry aborted");
-            options.onRecoveryProgress?.(`✂ Summarizing ${part.toolCalls.length} tool calls from split batch…`);
-            let overflow = false;
-            const result = await summarizeBatch(part, currentConfig.value, ctx, {
-              signal: options.signal,
-              sessionId: usageSessionId,
-              onUsage: (response) => onUsage(part, response),
-              onContextOverflow: () => { overflow = true; },
-              onTextProgress: (receivedChars) =>
-                reportBatchTextProgress(i, originalCount, part, receivedChars),
-            });
-            return overflow
-              ? { kind: "context-overflow" as const }
-              : result
-                ? { kind: "success" as const, value: result }
-                : { kind: "failure" as const };
-          };
-
-          const pieces = await splitOverflowingBatch(batch, retry, {
-            onSplit: () => {
-              setPruneStatusWidget(ctx, currentConfig.value, "splitting oversized batch…", statsAccum.getStats());
-              options.onRecoveryProgress?.("✂ Splitting oversized batch…");
-            },
-            onSingleCallOverflow: (part) => safeNotify(
-              ctx,
-              `pruner: one tool call (${part.toolCalls[0].toolName}) still exceeds the summarizer context window; original output retained`,
-              "warning"
-            ),
-          });
-          expanded.push(...pieces);
-
-          // /pruner now has one progress row for each original batch.
-          options.onProgress?.(
-            i, originalCount, batch,
-            pieces.every((piece) => piece.result !== null) ? "done" : "skipped"
-          );
+          batches = expanded.map((part) => part.batch);
+          results = expanded.map((part) => part.result);
         }
-
-        // Each successful leaf becomes its own persisted summary and index
-        // entry, in the original tool-call order. A failure leaves its suffix
-        // pending; the frontier must stop at the last successful leaf.
-        batches = expanded.map((piece) => piece.batch);
-        results = expanded.map((piece) => piece.result);
       }
 
       // Process results in order; stop at first null (individual call failure).
